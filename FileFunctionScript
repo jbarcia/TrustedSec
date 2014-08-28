@@ -1,0 +1,25 @@
+#!/bin/bash
+DIR=/root/saks/
+FILES=*
+EXT=.nbe
+
+for f in $DIR$FILES$EXT
+do
+  echo "Processing $f file..."
+
+# Output file contents
+#  cat $f
+
+filename=$(basename "$f")
+extension="${f##*.}"
+filename="${f%.*}"
+
+
+#Function To Perform
+nessus -i $f -o $filename.html
+
+
+#Debug
+#echo $filename
+#echo $extension
+done

